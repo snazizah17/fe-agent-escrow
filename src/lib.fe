@@ -1,0 +1,423 @@
+// AgentEscrow — an escrow for bounties paid to autonomous agents.
+//
+// A poster locks ETH into an escrow for a job, naming the worker (payee)
+// and an optional arbiter. The locked funds can only leave the contract
+// in two ways:
+//
+//   * Release — the poster or the arbiter pays the worker. This is the
+//     happy path: the work was delivered and accepted.
+//   * Refund  — the arbiter may refund the poster at any time (the work
+//     was rejected), and the poster may refund themselves once the
+//     deadline has passed (the worker never delivered).
+//
+// An arbiter of `Address::zero()` means "no arbiter": only the poster can
+// release, and only the deadline can unlock a refund.
+//
+// The contract is written in Fe and uses the language's effect system:
+// handlers declare exactly which capabilities they touch (`ctx` for the
+// call context, `call` for sending value, `log` for events, and the
+// individual storage fields), and amounts/timestamps use the unit-safe
+// `Wei` and `Timestamp` types so wei and seconds can never be confused
+// with plain integers at compile time.
+
+use std::abi::sol
+use std::evm::{Address, Call, Ctx, Evm, Log, StorageMap, ether}
+use std::evm::units::days
+
+// Escrow lifecycle states, stored per escrow.
+const STATE_NONE: u256 = 0
+const STATE_FUNDED: u256 = 1
+const STATE_RELEASED: u256 = 2
+const STATE_REFUNDED: u256 = 3
+
+msg EscrowMsg {
+    #[selector = sol("create(address,address,uint256)")]
+    Create { payee: Address, arbiter: Address, deadline: Timestamp } -> u256,
+    #[selector = sol("release(uint256)")]
+    Release { id: u256 },
+    #[selector = sol("refund(uint256)")]
+    Refund { id: u256 },
+    #[selector = sol("getEscrow(uint256)")]
+    GetEscrow { id: u256 } -> EscrowInfo,
+    #[selector = sol("nextId()")]
+    NextId -> u256,
+    #[selector = sol("totalLocked()")]
+    TotalLocked -> Wei,
+}
+
+#[event]
+struct EscrowCreated {
+    #[indexed]
+    id: u256,
+    #[indexed]
+    payer: Address,
+    #[indexed]
+    payee: Address,
+    arbiter: Address,
+    amount: Wei,
+    deadline: Timestamp,
+}
+
+#[event]
+struct EscrowReleased {
+    #[indexed]
+    id: u256,
+    #[indexed]
+    payee: Address,
+    amount: Wei,
+}
+
+#[event]
+struct EscrowRefunded {
+    #[indexed]
+    id: u256,
+    #[indexed]
+    payer: Address,
+    amount: Wei,
+}
+
+// What is stored on-chain for one escrow.
+struct Escrow {
+    payer: Address,
+    payee: Address,
+    arbiter: Address,
+    amount: Wei,
+    deadline: Timestamp,
+    state: u256,
+}
+
+// ABI view of an escrow, returned by `GetEscrow`.
+#[abi]
+pub struct EscrowInfo {
+    pub payer: Address,
+    pub payee: Address,
+    pub arbiter: Address,
+    pub amount: Wei,
+    pub deadline: Timestamp,
+    pub state: u256,
+}
+
+pub contract AgentEscrow uses (ctx: Ctx, call: mut Call, log: mut Log) {
+    mut escrows: StorageMap<u256, Escrow>,
+    mut next_id: u256,
+    mut total_locked: Wei,
+
+    recv EscrowMsg {
+        // Lock `ctx.value()` into a new escrow and return its id.
+        #[payable]
+        Create { payee, arbiter, deadline } -> u256
+        uses (ctx, mut escrows, mut next_id, mut total_locked, mut log)
+        {
+            let payer = ctx.caller()
+            let amount = ctx.value()
+            assert!(amount > Wei::zero(), "escrow amount must be positive")
+            assert!(
+                payee != Address::zero(),
+                "payee must not be the zero address",
+            )
+            assert!(
+                deadline > ctx.timestamp(),
+                "deadline must be in the future",
+            )
+
+            let id = next_id
+            next_id = id + 1
+            escrows
+                .set(
+                    key: id,
+                    value: Escrow { payer, payee, arbiter, amount, deadline, state: STATE_FUNDED },
+                )
+            total_locked += amount
+            log.emit(
+                EscrowCreated { id, payer, payee, arbiter, amount, deadline },
+            )
+            id
+        }
+
+        // Pay the worker. Only the poster or the arbiter may release.
+        Release { id } uses (ctx, mut escrows, mut total_locked, mut call, mut log) {
+            assert!(escrows[id].state == STATE_FUNDED, "escrow is not open")
+            let caller = ctx.caller()
+            assert!(
+                caller == escrows[id].payer || caller == escrows[id].arbiter,
+                "only the payer or the arbiter can release",
+            )
+            let payee = escrows[id].payee
+            let amount = escrows[id].amount
+            // Effects before the interaction: the state is settled before
+            // any value moves, so a re-entrant call finds a closed escrow.
+            escrows[id].state = STATE_RELEASED
+            total_locked -= amount
+            assert!(
+                call.send_value(addr: payee, gas: 0, value: amount).success(),
+                "payment to the payee failed",
+            )
+            log.emit(EscrowReleased { id, payee, amount })
+        }
+
+        // Return the funds to the poster. The arbiter may refund at any
+        // time; the poster must wait until the deadline has passed.
+        Refund { id } uses (ctx, mut escrows, mut total_locked, mut call, mut log) {
+            assert!(escrows[id].state == STATE_FUNDED, "escrow is not open")
+            let caller = ctx.caller()
+            let arbiter = escrows[id].arbiter
+            let is_arbiter = arbiter != Address::zero() && caller == arbiter
+            let is_payer = caller == escrows[id].payer
+            assert!(
+                is_arbiter || is_payer,
+                "only the payer or the arbiter can refund",
+            )
+            if is_payer && !is_arbiter {
+                assert!(
+                    ctx.timestamp() >= escrows[id].deadline,
+                    "the payer must wait until the deadline",
+                )
+            }
+            let payer = escrows[id].payer
+            let amount = escrows[id].amount
+            escrows[id].state = STATE_REFUNDED
+            total_locked -= amount
+            assert!(
+                call.send_value(addr: payer, gas: 0, value: amount).success(),
+                "refund to the payer failed",
+            )
+            log.emit(EscrowRefunded { id, payer, amount })
+        }
+
+        GetEscrow { id } -> EscrowInfo uses (escrows) {
+            EscrowInfo {
+                payer: escrows[id].payer,
+                payee: escrows[id].payee,
+                arbiter: escrows[id].arbiter,
+                amount: escrows[id].amount,
+                deadline: escrows[id].deadline,
+                state: escrows[id].state,
+            }
+        }
+
+        NextId -> u256 uses (next_id) {
+            next_id
+        }
+
+        TotalLocked -> Wei uses (total_locked) {
+            total_locked
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — run with `fe test`.
+// ---------------------------------------------------------------------------
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn create_then_release_pays_the_payee() uses (evm: mut Evm) {
+    let escrow = evm.create2<AgentEscrow>(value: Wei::zero(), args: (), salt: 0)
+    let poster = evm.address()
+    let agent = Address::new(42)
+    let arbiter = Address::new(7)
+    let deadline = evm.timestamp() + days(7)
+
+    let id: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: ether(2),
+            message: EscrowMsg::Create { payee: agent, arbiter, deadline },
+        )
+    assert!(id == 0)
+    assert!(evm.balance(escrow) == ether(2))
+
+    let info: EscrowInfo = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: EscrowMsg::GetEscrow { id },
+        )
+    assert!(info.payer == poster)
+    assert!(info.payee == agent)
+    assert!(info.arbiter == arbiter)
+    assert!(info.amount == ether(2))
+    assert!(info.deadline == deadline)
+    assert!(info.state == STATE_FUNDED)
+
+    let locked: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: EscrowMsg::TotalLocked {},
+        )
+    assert!(locked == ether(2))
+
+    evm.call(
+        addr: escrow,
+        gas: 300000,
+        value: Wei::zero(),
+        message: EscrowMsg::Release { id },
+    )
+    assert!(evm.balance(agent) == ether(2))
+    assert!(evm.balance(escrow) == Wei::zero())
+
+    let after: EscrowInfo = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: EscrowMsg::GetEscrow { id },
+        )
+    assert!(after.state == STATE_RELEASED)
+
+    let locked_after: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: EscrowMsg::TotalLocked {},
+        )
+    assert!(locked_after == Wei::zero())
+}
+
+#[test(balance = 10_000_000_000_000_000_000)]
+fn escrows_get_sequential_ids() uses (evm: mut Evm) {
+    let escrow = evm.create2<AgentEscrow>(value: Wei::zero(), args: (), salt: 0)
+    let deadline = evm.timestamp() + days(1)
+
+    let first: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: ether(1),
+            message: EscrowMsg::Create {
+                payee: Address::new(42),
+                arbiter: Address::zero(),
+                deadline,
+            },
+        )
+    let second: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: ether(3),
+            message: EscrowMsg::Create {
+                payee: Address::new(43),
+                arbiter: Address::zero(),
+                deadline,
+            },
+        )
+    assert!(first == 0)
+    assert!(second == 1)
+
+    let next: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: EscrowMsg::NextId {},
+        )
+    assert!(next == 2)
+
+    let locked: Wei = evm
+        .call(
+            addr: escrow,
+            gas: 100000,
+            value: Wei::zero(),
+            message: EscrowMsg::TotalLocked {},
+        )
+    assert!(locked == ether(4))
+    assert!(evm.balance(escrow) == ether(4))
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn create_with_no_value_reverts() uses (evm: mut Evm) {
+    let escrow = evm.create2<AgentEscrow>(value: Wei::zero(), args: (), salt: 0)
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: Wei::zero(),
+            message: EscrowMsg::Create {
+                payee: Address::new(42),
+                arbiter: Address::new(7),
+                deadline: evm.timestamp() + days(7),
+            },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn create_with_past_deadline_reverts() uses (evm: mut Evm) {
+    let escrow = evm.create2<AgentEscrow>(value: Wei::zero(), args: (), salt: 0)
+    let _: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: ether(1),
+            message: EscrowMsg::Create {
+                payee: Address::new(42),
+                arbiter: Address::new(7),
+                deadline: Timestamp::from_seconds(1),
+            },
+        )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn refund_before_deadline_reverts() uses (evm: mut Evm) {
+    let escrow = evm.create2<AgentEscrow>(value: Wei::zero(), args: (), salt: 0)
+    let id: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: ether(1),
+            message: EscrowMsg::Create {
+                payee: Address::new(42),
+                arbiter: Address::new(7),
+                deadline: evm.timestamp() + days(7),
+            },
+        )
+    // The poster is the caller here, and the deadline is a week away.
+    evm.call(
+        addr: escrow,
+        gas: 300000,
+        value: Wei::zero(),
+        message: EscrowMsg::Refund { id },
+    )
+}
+
+#[test(should_revert, balance = 10_000_000_000_000_000_000)]
+fn double_release_reverts() uses (evm: mut Evm) {
+    let escrow = evm.create2<AgentEscrow>(value: Wei::zero(), args: (), salt: 0)
+    let id: u256 = evm
+        .call(
+            addr: escrow,
+            gas: 300000,
+            value: ether(1),
+            message: EscrowMsg::Create {
+                payee: Address::new(42),
+                arbiter: Address::new(7),
+                deadline: evm.timestamp() + days(7),
+            },
+        )
+    evm.call(
+        addr: escrow,
+        gas: 300000,
+        value: Wei::zero(),
+        message: EscrowMsg::Release { id },
+    )
+    evm.call(
+        addr: escrow,
+        gas: 300000,
+        value: Wei::zero(),
+        message: EscrowMsg::Release { id },
+    )
+}
+
+#[test(should_revert)]
+fn release_unknown_escrow_reverts() uses (evm: mut Evm) {
+    let escrow = evm.create2<AgentEscrow>(value: Wei::zero(), args: (), salt: 0)
+    evm.call(
+        addr: escrow,
+        gas: 300000,
+        value: Wei::zero(),
+        message: EscrowMsg::Release { id: 99 },
+    )
+}
